@@ -5,9 +5,22 @@ const express = require("express");
 const { YoutubeTranscript } = require("youtube-transcript");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = (() => {
+  if (process.env.PORT === undefined) return 3000;
+  const n = Number(process.env.PORT);
+  if (!Number.isInteger(n) || n < 0 || n > 65535) {
+    console.error(`Error: invalid PORT "${process.env.PORT}" (expected 0-65535).`);
+    process.exit(1);
+  }
+  return n;
+})();
 
 app.disable("x-powered-by");
+
+// Trust explicit proxy config only (default: direct connections, req.ip is
+// the peer address). Set TRUST_PROXY=1 (or a subnet) behind nginx/Cloudflare
+// so per-IP rate limiting keys on clients instead of the proxy.
+if (process.env.TRUST_PROXY) app.set("trust proxy", process.env.TRUST_PROXY);
 
 // --- security headers (page embeds youtube.com, fetches same-origin /api) ---
 app.use((req, res, next) => {
@@ -133,8 +146,11 @@ function normalizeCues(raw) {
   return raw
     .map((c) => ({
       start: Math.max(0, ms ? c.offset / 1000 : c.offset),
-      duration: ms ? c.duration / 1000 : c.duration,
-      text: String(c.text || "").replace(/\s+/g, " ").trim(),
+      duration: Math.max(0, ms ? c.duration / 1000 : c.duration),
+      text: String(c.text || "")
+        .replace(/[\0-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "")
+        .replace(/\s+/g, " ")
+        .trim(),
     }))
     .filter((c) => Number.isFinite(c.start) && Number.isFinite(c.duration) && c.text)
     .sort((a, b) => a.start - b.start);
@@ -258,7 +274,11 @@ async function listTracks(videoId) {
     throw upstreamError("UPSTREAM", "Caption listing failed (bad upstream response).");
   }
   const playability = data?.playabilityStatus?.status;
-  if (playability === "ERROR" || playability === "LOGIN_REQUIRED" || playability === "UNPLAYABLE")
+  // Anything but an outright OK means the player won't serve this video to
+  // us right now (private, deleted, blocked, age-gated, not-yet-live…).
+  // LIVE_STREAM_OFFLINE is the one deliberate exception: a finished
+  // livestream's page can still expose caption tracks.
+  if (playability && playability !== "OK" && playability !== "LIVE_STREAM_OFFLINE")
     throw upstreamError(
       "VIDEO_UNAVAILABLE",
       data?.playabilityStatus?.reason || "This video is unavailable."
@@ -341,7 +361,8 @@ async function getTranscript(videoId, lang) {
   const key = `${videoId}|${lang || ""}`;
   const hit = transcriptCache.get(key);
   if (hit) {
-    if (hit.expires > Date.now()) return { cues: hit.cues, lang: hit.lang, fetchedAt: hit.fetchedAt };
+    if (hit.expires > Date.now())
+      return { cues: hit.cues.slice(), lang: hit.lang, fetchedAt: hit.fetchedAt };
     transcriptCache.delete(key); // don't let expired entries linger
   }
   // Fail fast when YouTube is throttling this server: one cheap call instead
@@ -359,7 +380,9 @@ async function getTranscript(videoId, lang) {
   );
   const cues = normalizeCues(raw);
   if (cues.length === 0) throw new Error("Empty transcript received from YouTube.");
-  const resolvedLang = raw[0]?.lang || lang || "en";
+  // Sanitize once, here: every consumer (JSON, filenames, headers, cache
+  // keys) gets a safe language code.
+  const resolvedLang = sanitizeLang(raw[0]?.lang, lang);
   const fetchedAt = new Date().toISOString();
   const value = { cues, lang: resolvedLang, fetchedAt, expires: Date.now() + CACHE_TTL_MS };
   const put = (k) => {
@@ -470,6 +493,10 @@ app.use("/api", (req, res) => res.status(404).json({ error: "Not found." }));
 let server = null;
 if (require.main === module) {
   server = app.listen(PORT, () => console.log(`youtube-transcriber on http://localhost:${PORT}`));
+  server.on("error", (err) => {
+    console.error(`Error: failed to listen: ${err.message}`);
+    process.exit(1);
+  });
   const shutdown = (sig) => {
     console.log(`${sig} received, draining…`);
     // Drop idle keep-alive sockets so close() doesn't wait on them.

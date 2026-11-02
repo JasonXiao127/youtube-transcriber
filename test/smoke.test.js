@@ -94,6 +94,12 @@ test("normalizeCues converts, filters and sorts", () => {
   ]);
   assert.equal(sorted[0].text, "a");
   assert.ok(normalizeCues([{ offset: -3, duration: 1, text: "a" }])[0].start >= 0);
+  assert.deepEqual(normalizeCues([{ offset: 5, duration: -3, text: "hi" }]), [
+    { start: 5, duration: 0, text: "hi" },
+  ]);
+  assert.deepEqual(normalizeCues([{ offset: 1, duration: 2, text: "a\u001b]0;evil\u0007b" }]), [
+    { start: 1, duration: 2, text: "a]0;evilb" },
+  ]);
 });
 
 test("formatHMS handles edges", () => {
@@ -424,6 +430,19 @@ test("CLI success paths with stubbed fetch (no network)", async () => {
     const langs = sink();
     assert.equal(await run(["GGGGGGGGGGG", "--list-langs"], { stdout: langs, stderr: sink() }), 0);
     assert.match(langs.get(), /No caption tracks found/);
+    let savedList = null;
+    const listOut = sink();
+    assert.equal(
+      await run(["GGGGGGGGGGG", "--list-langs", "-o", "langs.txt"], {
+        stdout: listOut,
+        stderr: sink(),
+        writeFile: (p, body) => { savedList = { p, body }; },
+      }),
+      0
+    );
+    assert.equal(savedList.p, "langs.txt");
+    assert.match(savedList.body, /No caption tracks found/);
+    assert.equal(listOut.get(), "");
   } finally {
     YT.YoutubeTranscript.fetchTranscript = origLib;
     globalThis.fetch = origFetch;
@@ -662,6 +681,62 @@ test("auto fetch populates the explicit-lang cache alias (stubbed)", async () =>
     });
   } finally {
     YT.YoutubeTranscript.fetchTranscript = orig;
+  }
+});
+test("cached cues are isolated from caller mutation (stubbed)", async () => {
+  const YT = require("youtube-transcript");
+  const orig = YT.YoutubeTranscript.fetchTranscript;
+  let calls = 0;
+  YT.YoutubeTranscript.fetchTranscript = async () => {
+    calls++;
+    return [{ offset: 1000, duration: 2000, text: "hi", lang: "en" }];
+  };
+  try {
+    await withUpstreamTracks(async () => {
+      const a = await (await fetch(`${base}/api/transcript?input=JJJJJJJJJJJ`)).json();
+      a.cues.push({ start: 99, duration: 1, text: "POISON" });
+      const b = await (await fetch(`${base}/api/transcript?input=JJJJJJJJJJJ`)).json();
+      assert.equal(calls, 1);
+      assert.equal(b.cues.length, 1);
+      assert.equal(b.cues[0].text, "hi");
+    });
+  } finally {
+    YT.YoutubeTranscript.fetchTranscript = orig;
+  }
+});
+
+test("upstream language is sanitized in transcript JSON (stubbed)", async () => {
+  const YT = require("youtube-transcript");
+  const orig = YT.YoutubeTranscript.fetchTranscript;
+  YT.YoutubeTranscript.fetchTranscript = async () => [
+    { offset: 1000, duration: 2000, text: "hi", lang: "en\r\nX:evil" },
+  ];
+  try {
+    await withUpstreamTracks(async () => {
+      const r = await fetch(`${base}/api/transcript?input=KKKKKKKKKKK&lang=en`);
+      assert.equal(r.status, 200);
+      assert.equal((await r.json()).lang, "en");
+    });
+  } finally {
+    YT.YoutubeTranscript.fetchTranscript = orig;
+  }
+});
+
+test("listTracks treats unknown non-OK playability as unavailable (stubbed)", async () => {
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url, opts) => {
+      if (!String(url).includes("youtubei")) return realFetch(url, opts);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ playabilityStatus: { status: "AGE_GATED" } }),
+      };
+    };
+    const r = await fetch(`${base}/api/tracks?input=LLLLLLLLLLL`);
+    assert.equal(r.status, 404);
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });
 test("fetchWithTimeout converts HTTP 429 to coded error", async () => {
